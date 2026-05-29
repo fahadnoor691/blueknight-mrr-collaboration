@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
+from typing import Annotated
 
-from fastapi import Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import CurrentUser, decode_token
@@ -20,3 +21,7 @@ def get_current_user(authorization: str | None = Header(default=None)) -> Curren
         )
     token = authorization.split(" ", 1)[1]
     return decode_token(token)
+
+
+DbSession = Annotated[AsyncSession, Depends(get_db)]
+CurrentUserDep = Annotated[CurrentUser, Depends(get_current_user)]
