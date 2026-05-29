@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import json
+import logging
+from typing import TYPE_CHECKING, Any
 
+from app.middleware import get_request_id
 from app.repository import sections as sections_repo
 from app.repository.sections import ReportMeta, ReportRead, Section
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 
 class SectionsError(Exception):
@@ -17,48 +22,24 @@ class SectionsError(Exception):
         super().__init__(message)
 
 
-def _report_not_found() -> SectionsError:
-    return SectionsError(
-        code="report_not_found", message="Report not found", status=404
-    )
-
-
-def _forbidden() -> SectionsError:
-    return SectionsError(
-        code="forbidden",
-        message="You do not have access to this report",
-        status=403,
-    )
-
-
 def _section_not_found() -> SectionsError:
     return SectionsError(
         code="section_not_found", message="Section not found", status=404
     )
 
 
-async def _ensure_access(
-    db: AsyncSession, *, actor_user_id: int, report_id: int
-) -> ReportMeta:
-    meta = await sections_repo.get_report_meta(db, report_id)
-    if meta is None:
-        raise _report_not_found()
-    if meta.owner_user_id == actor_user_id:
-        return meta
-    if await sections_repo.has_active_share(
-        db, report_id=report_id, user_id=actor_user_id
-    ):
-        return meta
-    raise _forbidden()
+def _version_mismatch() -> SectionsError:
+    return SectionsError(
+        code="version_mismatch",
+        message="The provided version does not match the current section version",
+        status=412,
+    )
 
 
 async def read_report(
-    db: AsyncSession, *, actor_user_id: int, report_id: int
+    db: AsyncSession, *, meta: ReportMeta
 ) -> ReportRead:
-    meta = await _ensure_access(
-        db, actor_user_id=actor_user_id, report_id=report_id
-    )
-    sections = await sections_repo.list_sections(db, report_id)
+    sections = await sections_repo.list_sections(db, meta.id)
     return ReportRead(
         id=meta.id,
         company_name=meta.company_name,
@@ -69,18 +50,60 @@ async def read_report(
 
 
 async def read_section(
-    db: AsyncSession,
-    *,
-    actor_user_id: int,
-    report_id: int,
-    section_key: str,
+    db: AsyncSession, *, meta: ReportMeta, section_key: str
 ) -> Section:
-    await _ensure_access(
-        db, actor_user_id=actor_user_id, report_id=report_id
-    )
     section = await sections_repo.get_section(
-        db, report_id=report_id, section_key=section_key
+        db, report_id=meta.id, section_key=section_key
     )
     if section is None:
         raise _section_not_found()
     return section
+
+
+async def write_section(
+    db: AsyncSession,
+    *,
+    meta: ReportMeta,
+    editor_user_id: int,
+    section_key: str,
+    expected_version: int,
+    new_content: dict[str, Any],
+) -> Section:
+    result = await sections_repo.write_section_atomic(
+        db,
+        report_id=meta.id,
+        section_key=section_key,
+        expected_version=expected_version,
+        new_content=new_content,
+        editor_user_id=editor_user_id,
+    )
+    if not result.section_existed:
+        raise _section_not_found()
+    if result.version_after is None:
+        raise _version_mismatch()
+    assert result.updated_at is not None
+
+    await db.commit()
+
+    logger.info(
+        json.dumps(
+            {
+                "request_id": get_request_id(),
+                "operation": "section.write",
+                "user_id": editor_user_id,
+                "report_id": meta.id,
+                "section_key": section_key,
+                "version_before": expected_version,
+                "version_after": result.version_after,
+                "source": "human",
+            }
+        )
+    )
+
+    return Section(
+        section_key=section_key,
+        content=new_content,
+        version=result.version_after,
+        updated_at=result.updated_at,
+        updated_by_user_id=editor_user_id,
+    )

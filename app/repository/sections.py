@@ -2,9 +2,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import bindparam, select, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.enums import SharePermission
 from app.models import MarketResearchReport, ReportSection, ReportShare
 
 
@@ -33,6 +35,13 @@ class ReportRead:
     company_url: str | None
     created_at: datetime
     sections: list[Section]
+
+
+@dataclass(frozen=True)
+class WriteResult:
+    section_existed: bool
+    version_after: int | None
+    updated_at: datetime | None
 
 
 async def get_report_meta(
@@ -65,6 +74,22 @@ async def has_active_share(
         .where(
             ReportShare.report_id == report_id,
             ReportShare.target_user_id == user_id,
+            ReportShare.revoked_at.is_(None),
+        )
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none() is not None
+
+
+async def has_edit_share(
+    db: AsyncSession, *, report_id: int, user_id: int
+) -> bool:
+    stmt = (
+        select(ReportShare.id)
+        .where(
+            ReportShare.report_id == report_id,
+            ReportShare.target_user_id == user_id,
+            ReportShare.permission == SharePermission.edit,
             ReportShare.revoked_at.is_(None),
         )
         .limit(1)
@@ -109,4 +134,72 @@ async def get_section(
         version=s.version,
         updated_at=s.updated_at,
         updated_by_user_id=s.updated_by_user_id,
+    )
+
+
+_WRITE_SECTION_SQL = text(
+    """
+WITH prior AS (
+    SELECT content AS content_before
+    FROM report_sections
+    WHERE report_id = :report_id AND section_key = :section_key
+),
+updated AS (
+    UPDATE report_sections
+    SET content = :new_content,
+        version = version + 1,
+        updated_at = now(),
+        updated_by_user_id = :editor_user_id
+    WHERE report_id = :report_id
+      AND section_key = :section_key
+      AND version = :expected_version
+    RETURNING version, updated_at
+),
+audit AS (
+    INSERT INTO report_section_edits (
+        report_id, section_key,
+        version_before, version_after,
+        content_before, content_after,
+        editor_user_id, source
+    )
+    SELECT :report_id, :section_key,
+           :expected_version, updated.version,
+           prior.content_before, :new_content,
+           :editor_user_id, 'human'::edit_source
+    FROM updated, prior
+    RETURNING id
+)
+SELECT
+    EXISTS (SELECT 1 FROM prior)        AS section_existed,
+    (SELECT version    FROM updated)    AS version_after,
+    (SELECT updated_at FROM updated)    AS updated_at
+"""
+).bindparams(bindparam("new_content", type_=JSONB))
+
+
+async def write_section_atomic(
+    db: AsyncSession,
+    *,
+    report_id: int,
+    section_key: str,
+    expected_version: int,
+    new_content: dict[str, Any],
+    editor_user_id: int,
+) -> WriteResult:
+    row = (
+        await db.execute(
+            _WRITE_SECTION_SQL,
+            {
+                "report_id": report_id,
+                "section_key": section_key,
+                "expected_version": expected_version,
+                "new_content": new_content,
+                "editor_user_id": editor_user_id,
+            },
+        )
+    ).one()
+    return WriteResult(
+        section_existed=row[0],
+        version_after=row[1],
+        updated_at=row[2],
     )
