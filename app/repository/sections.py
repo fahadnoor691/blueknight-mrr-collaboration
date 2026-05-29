@@ -2,12 +2,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import bindparam, select, text
+from sqlalchemy import bindparam, select, text, tuple_
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.enums import SharePermission
-from app.models import MarketResearchReport, ReportSection, ReportShare
+from app.enums import EditSource, SharePermission
+from app.models import (
+    MarketResearchReport,
+    ReportSection,
+    ReportSectionEdit,
+    ReportShare,
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +47,30 @@ class WriteResult:
     section_existed: bool
     version_after: int | None
     updated_at: datetime | None
+
+
+@dataclass(frozen=True)
+class HistoryCursor:
+    ts: datetime
+    edit_id: int
+
+
+@dataclass(frozen=True)
+class Edit:
+    id: int
+    version_before: int
+    version_after: int
+    content_before: dict[str, Any]
+    content_after: dict[str, Any]
+    editor_user_id: int
+    source: EditSource
+    ts: datetime
+
+
+@dataclass(frozen=True)
+class HistoryPage:
+    edits: list[Edit]
+    next_cursor: HistoryCursor | None
 
 
 async def get_report_meta(
@@ -203,3 +232,40 @@ async def write_section_atomic(
         version_after=row[1],
         updated_at=row[2],
     )
+
+
+async def list_section_edits(
+    db: AsyncSession,
+    *,
+    report_id: int,
+    section_key: str,
+    limit: int,
+    cursor: HistoryCursor | None,
+) -> list[Edit]:
+    stmt = select(ReportSectionEdit).where(
+        ReportSectionEdit.report_id == report_id,
+        ReportSectionEdit.section_key == section_key,
+    )
+    if cursor is not None:
+        stmt = stmt.where(
+            tuple_(ReportSectionEdit.ts, ReportSectionEdit.id)
+            < tuple_(cursor.ts, cursor.edit_id)
+        )
+    stmt = stmt.order_by(
+        ReportSectionEdit.ts.desc(),
+        ReportSectionEdit.id.desc(),
+    ).limit(limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        Edit(
+            id=r.id,
+            version_before=r.version_before,
+            version_after=r.version_after,
+            content_before=r.content_before,
+            content_after=r.content_after,
+            editor_user_id=r.editor_user_id,
+            source=r.source,
+            ts=r.ts,
+        )
+        for r in rows
+    ]

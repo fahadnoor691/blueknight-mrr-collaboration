@@ -1,3 +1,5 @@
+import base64
+import json
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
@@ -7,13 +9,15 @@ from fastapi import (
     Header,
     HTTPException,
     Path,
+    Query,
     Response,
 )
 from pydantic import BaseModel, ConfigDict, field_serializer
 
 from app.dependencies import CurrentUserDep, DbSession
+from app.enums import EditSource
 from app.repository import sections as sections_repo
-from app.repository.sections import ReportMeta
+from app.repository.sections import HistoryCursor, ReportMeta
 from app.services import sections as sections_service
 
 router = APIRouter(prefix="/reports", tags=["sections"])
@@ -102,9 +106,41 @@ def require_if_match(
         )
 
 
+def parse_history_cursor(
+    cursor: Annotated[str | None, Query()] = None,
+) -> HistoryCursor | None:
+    if cursor is None:
+        return None
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        data = json.loads(raw)
+        return HistoryCursor(
+            ts=datetime.fromisoformat(data["ts"]),
+            edit_id=int(data["id"]),
+        )
+    except (ValueError, KeyError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_cursor", "message": "Cursor is malformed"},
+        ) from None
+
+
+def _encode_cursor(c: HistoryCursor) -> str:
+    payload = json.dumps(
+        {"ts": c.ts.isoformat(), "id": c.edit_id}, separators=(",", ":")
+    )
+    return (
+        base64.urlsafe_b64encode(payload.encode("utf-8"))
+        .decode("ascii")
+        .rstrip("=")
+    )
+
+
 ViewAccess = Annotated[ReportMeta, Depends(require_view_access)]
 EditAccess = Annotated[ReportMeta, Depends(require_edit_access)]
 IfMatch = Annotated[int, Depends(require_if_match)]
+HistoryCursorDep = Annotated[HistoryCursor | None, Depends(parse_history_cursor)]
 
 
 class SectionResponse(BaseModel):
@@ -137,6 +173,28 @@ class ReportResponse(BaseModel):
 
 class UpdateSectionRequest(BaseModel):
     content: dict[str, Any]
+
+
+class EditResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    version_before: int
+    version_after: int
+    content_before: dict[str, Any]
+    content_after: dict[str, Any]
+    editor_user_id: int
+    source: EditSource
+    ts: datetime
+
+    @field_serializer("ts")
+    def _serialize_ts(self, value: datetime) -> str:
+        return value.astimezone(timezone.utc).isoformat()
+
+
+class HistoryResponse(BaseModel):
+    edits: list[EditResponse]
+    next_cursor: str | None
 
 
 def _http_error(err: sections_service.SectionsError) -> HTTPException:
@@ -173,6 +231,33 @@ async def read_section(
         raise _http_error(err) from err
     response.headers["ETag"] = f'"{section.version}"'
     return SectionResponse.model_validate(section)
+
+
+@router.get(
+    "/{report_id}/sections/{section_key}/history",
+    response_model=HistoryResponse,
+)
+async def read_section_history(
+    meta: ViewAccess,
+    section_key: Annotated[str, Path(min_length=1)],
+    db: DbSession,
+    cursor: HistoryCursorDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> HistoryResponse:
+    try:
+        page = await sections_service.read_history(
+            db,
+            meta=meta,
+            section_key=section_key,
+            limit=limit,
+            cursor=cursor,
+        )
+    except sections_service.SectionsError as err:
+        raise _http_error(err) from err
+    return HistoryResponse(
+        edits=[EditResponse.model_validate(e) for e in page.edits],
+        next_cursor=_encode_cursor(page.next_cursor) if page.next_cursor else None,
+    )
 
 
 @router.patch(

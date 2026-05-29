@@ -6,7 +6,13 @@ from typing import TYPE_CHECKING, Any
 
 from app.middleware import get_request_id
 from app.repository import sections as sections_repo
-from app.repository.sections import ReportMeta, ReportRead, Section
+from app.repository.sections import (
+    HistoryCursor,
+    HistoryPage,
+    ReportMeta,
+    ReportRead,
+    Section,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -107,3 +113,33 @@ async def write_section(
         updated_at=result.updated_at,
         updated_by_user_id=editor_user_id,
     )
+
+
+async def read_history(
+    db: AsyncSession,
+    *,
+    meta: ReportMeta,
+    section_key: str,
+    limit: int,
+    cursor: HistoryCursor | None,
+) -> HistoryPage:
+    if await sections_repo.get_section(
+        db, report_id=meta.id, section_key=section_key
+    ) is None:
+        raise _section_not_found()
+
+    rows = await sections_repo.list_section_edits(
+        db,
+        report_id=meta.id,
+        section_key=section_key,
+        limit=limit + 1,
+        cursor=cursor,
+    )
+
+    has_more = len(rows) > limit
+    edits = rows[:limit]
+    next_cursor: HistoryCursor | None = None
+    if has_more:
+        last = edits[-1]
+        next_cursor = HistoryCursor(ts=last.ts, edit_id=last.id)
+    return HistoryPage(edits=edits, next_cursor=next_cursor)
