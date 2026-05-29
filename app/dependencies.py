@@ -1,0 +1,22 @@
+from collections.abc import AsyncIterator
+
+from fastapi import Header, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.auth import CurrentUser, decode_token
+from app.database import SessionLocal
+
+
+async def get_db() -> AsyncIterator[AsyncSession]:
+    async with SessionLocal() as session:
+        yield session
+
+
+def get_current_user(authorization: str | None = Header(default=None)) -> CurrentUser:
+    if authorization is None or not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "missing_token", "message": "Authorization bearer token required"},
+        )
+    token = authorization.split(" ", 1)[1]
+    return decode_token(token)
