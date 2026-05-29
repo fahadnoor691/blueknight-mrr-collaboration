@@ -197,6 +197,11 @@ class HistoryResponse(BaseModel):
     next_cursor: str | None
 
 
+class RevertResponse(BaseModel):
+    version: int
+    content: dict[str, Any]
+
+
 def _http_error(err: sections_service.SectionsError) -> HTTPException:
     return HTTPException(
         status_code=err.status,
@@ -286,3 +291,27 @@ async def write_section(
         raise _http_error(err) from err
     response.headers["ETag"] = f'"{section.version}"'
     return SectionResponse.model_validate(section)
+
+
+@router.post(
+    "/{report_id}/sections/{section_key}/revert/{edit_id}",
+    response_model=RevertResponse,
+)
+async def revert_section(
+    meta: EditAccess,
+    section_key: Annotated[str, Path(min_length=1)],
+    edit_id: Annotated[int, Path(gt=0)],
+    current_user: CurrentUserDep,
+    db: DbSession,
+) -> RevertResponse:
+    try:
+        section = await sections_service.revert_section(
+            db,
+            meta=meta,
+            editor_user_id=current_user.user_id,
+            section_key=section_key,
+            target_edit_id=edit_id,
+        )
+    except sections_service.SectionsError as err:
+        raise _http_error(err) from err
+    return RevertResponse(version=section.version, content=section.content)

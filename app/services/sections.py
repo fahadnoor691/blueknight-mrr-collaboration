@@ -42,6 +42,14 @@ def _version_mismatch() -> SectionsError:
     )
 
 
+def _edit_not_found() -> SectionsError:
+    return SectionsError(
+        code="edit_not_found",
+        message="Edit not found for this section",
+        status=404,
+    )
+
+
 async def read_report(
     db: AsyncSession, *, meta: ReportMeta
 ) -> ReportRead:
@@ -109,6 +117,55 @@ async def write_section(
     return Section(
         section_key=section_key,
         content=new_content,
+        version=result.version_after,
+        updated_at=result.updated_at,
+        updated_by_user_id=editor_user_id,
+    )
+
+
+async def revert_section(
+    db: AsyncSession,
+    *,
+    meta: ReportMeta,
+    editor_user_id: int,
+    section_key: str,
+    target_edit_id: int,
+) -> Section:
+    result = await sections_repo.revert_section_atomic(
+        db,
+        report_id=meta.id,
+        section_key=section_key,
+        target_edit_id=target_edit_id,
+        editor_user_id=editor_user_id,
+    )
+    if not result.edit_existed:
+        raise _edit_not_found()
+    if not result.section_existed:
+        raise _section_not_found()
+    assert result.version_after is not None
+    assert result.updated_at is not None
+    assert result.new_content is not None
+
+    await db.commit()
+
+    logger.info(
+        json.dumps(
+            {
+                "request_id": get_request_id(),
+                "operation": "section.revert",
+                "user_id": editor_user_id,
+                "report_id": meta.id,
+                "section_key": section_key,
+                "target_edit_id": target_edit_id,
+                "version_after": result.version_after,
+                "source": "revert",
+            }
+        )
+    )
+
+    return Section(
+        section_key=section_key,
+        content=result.new_content,
         version=result.version_after,
         updated_at=result.updated_at,
         updated_by_user_id=editor_user_id,

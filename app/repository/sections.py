@@ -73,6 +73,15 @@ class HistoryPage:
     next_cursor: HistoryCursor | None
 
 
+@dataclass(frozen=True)
+class RevertResult:
+    edit_existed: bool
+    section_existed: bool
+    version_after: int | None
+    updated_at: datetime | None
+    new_content: dict[str, Any] | None
+
+
 async def get_report_meta(
     db: AsyncSession, report_id: int
 ) -> ReportMeta | None:
@@ -231,6 +240,84 @@ async def write_section_atomic(
         section_existed=row[0],
         version_after=row[1],
         updated_at=row[2],
+    )
+
+
+_REVERT_SECTION_SQL = text(
+    """
+WITH target_edit AS (
+    SELECT content_before AS revert_content
+    FROM report_section_edits
+    WHERE id = :edit_id
+      AND report_id = :report_id
+      AND section_key = :section_key
+),
+prior AS (
+    SELECT content AS content_before, version AS version_before
+    FROM report_sections
+    WHERE report_id = :report_id AND section_key = :section_key
+    FOR UPDATE
+),
+updated AS (
+    UPDATE report_sections
+    SET content = (SELECT revert_content FROM target_edit),
+        version = version + 1,
+        updated_at = now(),
+        updated_by_user_id = :editor_user_id
+    WHERE report_id = :report_id
+      AND section_key = :section_key
+      AND EXISTS (SELECT 1 FROM target_edit)
+    RETURNING version, updated_at
+),
+audit AS (
+    INSERT INTO report_section_edits (
+        report_id, section_key,
+        version_before, version_after,
+        content_before, content_after,
+        editor_user_id, source
+    )
+    SELECT :report_id, :section_key,
+           prior.version_before, updated.version,
+           prior.content_before, target_edit.revert_content,
+           :editor_user_id, 'revert'::edit_source
+    FROM updated, prior, target_edit
+    RETURNING id
+)
+SELECT
+    EXISTS (SELECT 1 FROM target_edit)        AS edit_existed,
+    EXISTS (SELECT 1 FROM prior)              AS section_existed,
+    (SELECT version       FROM updated)       AS version_after,
+    (SELECT updated_at    FROM updated)       AS updated_at,
+    (SELECT revert_content FROM target_edit)  AS new_content
+"""
+)
+
+
+async def revert_section_atomic(
+    db: AsyncSession,
+    *,
+    report_id: int,
+    section_key: str,
+    target_edit_id: int,
+    editor_user_id: int,
+) -> RevertResult:
+    row = (
+        await db.execute(
+            _REVERT_SECTION_SQL,
+            {
+                "report_id": report_id,
+                "section_key": section_key,
+                "edit_id": target_edit_id,
+                "editor_user_id": editor_user_id,
+            },
+        )
+    ).one()
+    return RevertResult(
+        edit_existed=row[0],
+        section_existed=row[1],
+        version_after=row[2],
+        updated_at=row[3],
+        new_content=row[4],
     )
 
 
