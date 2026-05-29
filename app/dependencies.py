@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import CurrentUser, decode_token
 from app.database import SessionLocal
+from app.llm_client import InMemoryLLMClient, LLMClient
 
 
 async def get_db() -> AsyncIterator[AsyncSession]:
@@ -23,5 +24,13 @@ def get_current_user(authorization: str | None = Header(default=None)) -> Curren
     return decode_token(token)
 
 
+_llm_client: LLMClient = InMemoryLLMClient()
+
+
+def get_llm_client() -> LLMClient:
+    return _llm_client
+
+
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 CurrentUserDep = Annotated[CurrentUser, Depends(get_current_user)]
+LLMClientDep = Annotated[LLMClient, Depends(get_llm_client)]

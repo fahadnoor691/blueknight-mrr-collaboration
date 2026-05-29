@@ -12,9 +12,9 @@ from fastapi import (
     Query,
     Response,
 )
-from pydantic import BaseModel, ConfigDict, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
-from app.dependencies import CurrentUserDep, DbSession
+from app.dependencies import CurrentUserDep, DbSession, LLMClientDep
 from app.enums import EditSource
 from app.repository import sections as sections_repo
 from app.repository.sections import HistoryCursor, ReportMeta
@@ -202,6 +202,15 @@ class RevertResponse(BaseModel):
     content: dict[str, Any]
 
 
+class AiRewriteRequest(BaseModel):
+    instruction: str = Field(min_length=1)
+
+
+class AiRewriteResponse(BaseModel):
+    version: int
+    content: dict[str, Any]
+
+
 def _http_error(err: sections_service.SectionsError) -> HTTPException:
     return HTTPException(
         status_code=err.status,
@@ -315,3 +324,31 @@ async def revert_section(
     except sections_service.SectionsError as err:
         raise _http_error(err) from err
     return RevertResponse(version=section.version, content=section.content)
+
+
+@router.post(
+    "/{report_id}/sections/{section_key}/ai-rewrite",
+    response_model=AiRewriteResponse,
+)
+async def ai_rewrite_section(
+    meta: EditAccess,
+    section_key: Annotated[str, Path(min_length=1)],
+    body: AiRewriteRequest,
+    if_match: IfMatch,
+    current_user: CurrentUserDep,
+    llm_client: LLMClientDep,
+    db: DbSession,
+) -> AiRewriteResponse:
+    try:
+        section = await sections_service.ai_rewrite_section(
+            db,
+            meta=meta,
+            editor_user_id=current_user.user_id,
+            section_key=section_key,
+            expected_version=if_match,
+            instruction=body.instruction,
+            llm_client=llm_client,
+        )
+    except sections_service.SectionsError as err:
+        raise _http_error(err) from err
+    return AiRewriteResponse(version=section.version, content=section.content)

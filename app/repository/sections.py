@@ -203,7 +203,7 @@ audit AS (
     SELECT :report_id, :section_key,
            :expected_version, updated.version,
            prior.content_before, :new_content,
-           :editor_user_id, 'human'::edit_source
+           :editor_user_id, CAST(:source AS edit_source)
     FROM updated, prior
     RETURNING id
 )
@@ -223,6 +223,7 @@ async def write_section_atomic(
     expected_version: int,
     new_content: dict[str, Any],
     editor_user_id: int,
+    source: EditSource,
 ) -> WriteResult:
     row = (
         await db.execute(
@@ -233,6 +234,7 @@ async def write_section_atomic(
                 "expected_version": expected_version,
                 "new_content": new_content,
                 "editor_user_id": editor_user_id,
+                "source": source.value,
             },
         )
     ).one()
